@@ -744,6 +744,7 @@ class _CodexCompletionsAdapter:
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
         deadline = time.monotonic() + float(total_timeout) if total_timeout else None
         timed_out = threading.Event()
+        timeout_cleanup_started = threading.Event()
         timeout_timer: Optional[threading.Timer] = None
 
         def _timeout_message() -> str:
@@ -751,6 +752,9 @@ class _CodexCompletionsAdapter:
 
         def _close_client_on_timeout() -> None:
             timed_out.set()
+            if timeout_cleanup_started.is_set():
+                return
+            timeout_cleanup_started.set()
             close = getattr(self._client, "close", None)
             if callable(close):
                 try:
@@ -2552,6 +2556,7 @@ def _retry_same_provider_sync(
     tools: Optional[list],
     effective_timeout: float,
     effective_extra_body: dict,
+    use_cache: bool = True,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -2569,6 +2574,7 @@ def _retry_same_provider_sync(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            use_cache=use_cache,
         )
     if retry_client is None:
         raise RuntimeError(
@@ -2589,9 +2595,13 @@ def _retry_same_provider_sync(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
-    return _validate_llm_response(
-        retry_client.chat.completions.create(**retry_kwargs), task,
-    )
+    try:
+        return _validate_llm_response(
+            retry_client.chat.completions.create(**retry_kwargs), task,
+        )
+    finally:
+        if not use_cache:
+            _close_aux_client_quietly(retry_client)
 
 
 async def _retry_same_provider_async(
@@ -3935,7 +3945,7 @@ def resolve_vision_provider_client(
 
 def get_auxiliary_extra_body() -> dict:
     """Return extra_body kwargs for auxiliary API calls.
-    
+
     Includes Nous Portal product tags when the auxiliary client is backed
     by Nous Portal. Returns empty dict otherwise.
     """
@@ -3944,7 +3954,7 @@ def get_auxiliary_extra_body() -> dict:
 
 def auxiliary_max_tokens_param(value: int) -> dict:
     """Return the correct max tokens kwarg for the auxiliary client's provider.
-    
+
     OpenRouter and local models use 'max_tokens'. Direct OpenAI with newer
     models (gpt-4o, o-series, gpt-5+) requires 'max_completion_tokens'.
     The Codex adapter translates max_tokens internally, so we use max_tokens
@@ -4024,8 +4034,9 @@ def _refresh_nous_auxiliary_client(
     api_mode: Optional[str] = None,
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
+    use_cache: bool = True,
 ) -> Tuple[Optional[Any], Optional[str]]:
-    """Refresh Nous runtime creds, rebuild the client, and replace the cache entry."""
+    """Refresh Nous runtime creds, rebuild the client, and optionally replace the cache entry."""
     runtime = _resolve_nous_runtime_api(force_refresh=True)
     if runtime is None:
         return None, model
@@ -4054,7 +4065,8 @@ def _refresh_nous_auxiliary_client(
         main_runtime=main_runtime,
         is_vision=is_vision,
     )
-    _store_cached_client(cache_key, client, final_model, bound_loop=current_loop)
+    if use_cache:
+        _store_cached_client(cache_key, client, final_model, bound_loop=current_loop)
     return client, final_model
 
 
@@ -4103,12 +4115,32 @@ def _force_close_async_httpx(client: Any) -> None:
     connections will be dropped by the OS when the process exits.
     """
     try:
+        import httpx
         from httpx._client import ClientState
+
         inner = getattr(client, "_client", None)
-        if inner is not None and not getattr(inner, "is_closed", True):
+        # Only force-mark async httpx clients.  Sync httpx.Client.close() skips
+        # transport cleanup if _state is already CLOSED, so pre-marking sync
+        # clients leaks one-off title-generation transports.
+        if isinstance(inner, httpx.AsyncClient) and not getattr(inner, "is_closed", True):
             inner._state = ClientState.CLOSED
     except Exception:
         pass
+
+
+def _close_aux_client_quietly(client: Any) -> None:
+    """Best-effort close for one-off auxiliary clients that are not cached."""
+    import inspect
+
+    if client is None:
+        return
+    _force_close_async_httpx(client)
+    try:
+        close_fn = getattr(client, "close", None)
+        if callable(close_fn) and not inspect.iscoroutinefunction(close_fn):
+            close_fn()
+    except Exception:
+        logger.debug("Auxiliary: failed to close one-off client", exc_info=True)
 
 
 def shutdown_cached_clients() -> None:
@@ -4181,6 +4213,38 @@ def _compat_model(client: Any, model: Optional[str], cached_default: Optional[st
     return model or cached_default
 
 
+def _is_aux_client_closed(client: Any) -> bool:
+    """Best-effort detection for cached auxiliary clients whose transport is closed."""
+    seen: set[int] = set()
+
+    def _walk(obj: Any) -> bool:
+        if obj is None:
+            return False
+        oid = id(obj)
+        if oid in seen:
+            return False
+        seen.add(oid)
+        try:
+            closed = getattr(obj, "is_closed", None)
+        except Exception:
+            closed = None
+        if closed is True:
+            return True
+        try:
+            attrs = vars(obj)
+        except TypeError:
+            attrs = {}
+        for attr in ("_client", "_real_client", "client"):
+            # Use vars()/__dict__ rather than getattr(): MagicMock fabricates
+            # arbitrary child mocks on getattr(), which can recurse forever.
+            child = attrs.get(attr)
+            if child is not None and child is not obj and _walk(child):
+                return True
+        return False
+
+    return _walk(client)
+
+
 def _get_cached_client(
     provider: str,
     model: str = None,
@@ -4190,6 +4254,7 @@ def _get_cached_client(
     api_mode: str = None,
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
+    use_cache: bool = True,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Get or create a cached client for the given provider.
 
@@ -4228,27 +4293,30 @@ def _get_cached_client(
         main_runtime=main_runtime,
         is_vision=is_vision,
     )
-    with _client_cache_lock:
-        if cache_key in _client_cache:
-            cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            if async_mode:
-                # Validate: the cached client must be bound to the CURRENT,
-                # OPEN loop.  If the loop changed or was closed, the httpx
-                # transport inside is dead — force-close and replace.
-                loop_ok = (
-                    cached_loop is not None
-                    and cached_loop is current_loop
-                    and not cached_loop.is_closed()
-                )
-                if loop_ok:
+    if use_cache:
+        with _client_cache_lock:
+            if cache_key in _client_cache:
+                cached_client, cached_default, cached_loop = _client_cache[cache_key]
+                if _is_aux_client_closed(cached_client):
+                    _client_cache.pop(cache_key, None)
+                elif async_mode:
+                    # Validate: the cached client must be bound to the CURRENT,
+                    # OPEN loop.  If the loop changed or was closed, the httpx
+                    # transport inside is dead — force-close and replace.
+                    loop_ok = (
+                        cached_loop is not None
+                        and cached_loop is current_loop
+                        and not cached_loop.is_closed()
+                    )
+                    if loop_ok:
+                        effective = _compat_model(cached_client, model, cached_default)
+                        return cached_client, effective
+                    # Stale — evict and fall through to create a new client.
+                    _force_close_async_httpx(cached_client)
+                    del _client_cache[cache_key]
+                else:
                     effective = _compat_model(cached_client, model, cached_default)
                     return cached_client, effective
-                # Stale — evict and fall through to create a new client.
-                _force_close_async_httpx(cached_client)
-                del _client_cache[cache_key]
-            else:
-                effective = _compat_model(cached_client, model, cached_default)
-                return cached_client, effective
     # Build outside the lock
     client, default_model = resolve_provider_client(
         provider,
@@ -4260,7 +4328,7 @@ def _get_cached_client(
         main_runtime=runtime,
         is_vision=is_vision,
     )
-    if client is not None:
+    if client is not None and use_cache:
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
@@ -4610,6 +4678,7 @@ def call_llm(
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
+    use_cache = True
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
@@ -4635,6 +4704,11 @@ def call_llm(
             )
         resolved_provider = effective_provider or resolved_provider
     else:
+        # Title generation runs fire-and-forget in a background thread after
+        # the user-facing response has already been delivered.  Keep it off
+        # the shared cache so background title calls never inherit a stale or
+        # closed Responses client from an earlier auxiliary timeout.
+        use_cache = task != "title_generation"
         client, final_model = _get_cached_client(
             resolved_provider,
             resolved_model,
@@ -4642,6 +4716,7 @@ def call_llm(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            use_cache=use_cache,
         )
         if client is None:
             # When the user explicitly chose a non-OpenRouter provider but no
@@ -4662,275 +4737,289 @@ def call_llm(
             if not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto", main_runtime=main_runtime)
+                client, final_model = _get_cached_client(
+                    "auto", main_runtime=main_runtime, use_cache=(task != "title_generation")
+                )
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
-
-    # Log what we're about to do — makes auxiliary operations visible
-    _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
-    if task:
-        logger.info("Auxiliary %s: using %s (%s)%s",
-                     task, resolved_provider or "auto", final_model or "default",
-                     f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "")
-
-    # Pass the client's actual base_url (not just resolved_base_url) so
-    # endpoint-specific temperature overrides can distinguish
-    # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
-    kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
-        temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
-        base_url=_base_info or resolved_base_url)
-
-    # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
-    _client_base = str(getattr(client, "base_url", "") or "")
-    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
-        kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
-
-    # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
-    # then payment fallback.
+    uncached_clients_to_close = [client] if not use_cache else []
     try:
-        return _validate_llm_response(
-            client.chat.completions.create(**kwargs), task)
-    except Exception as first_err:
-        if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
-            retry_kwargs = dict(kwargs)
-            retry_kwargs.pop("temperature", None)
-            logger.info(
-                "Auxiliary %s: provider rejected temperature; retrying once without it",
-                task or "call",
-            )
-            try:
-                return _validate_llm_response(
-                    client.chat.completions.create(**retry_kwargs), task)
-            except Exception as retry_err:
-                retry_err_str = str(retry_err)
-                # If retry still fails, fall through to the max_tokens /
-                # payment / auth chains below using the temperature-stripped
-                # kwargs.  Re-raise only if the retry hit something those
-                # chains won't handle.
-                if not (
-                    _is_payment_error(retry_err)
-                    or _is_connection_error(retry_err)
-                    or _is_auth_error(retry_err)
-                    or "max_tokens" in retry_err_str
-                    or "unsupported_parameter" in retry_err_str
-                ):
-                    raise
-                first_err = retry_err
-                kwargs = retry_kwargs
+        effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
 
-        err_str = str(first_err)
-        # ZAI vision models (glm-4v-flash etc.) return error code 1210
-        # ("API 调用参数有误") when max_tokens is passed on multimodal
-        # calls.  The error message does NOT contain "max_tokens" so the
-        # generic retry below never fires.  Detect the ZAI-specific error
-        # and strip max_tokens before retrying.
-        _is_zai_param_error = (
-            "1210" in err_str
-            and "bigmodel" in str(getattr(client, "base_url", ""))
-        )
-        if max_tokens is not None and (
-            "max_tokens" in err_str
-            or "unsupported_parameter" in err_str
-            or _is_unsupported_parameter_error(first_err, "max_tokens")
-            or _is_zai_param_error
-        ):
-            kwargs.pop("max_tokens", None)
-            kwargs.pop("max_completion_tokens", None)
-            try:
-                return _validate_llm_response(
-                    client.chat.completions.create(**kwargs), task)
-            except Exception as retry_err:
-                # If the max_tokens retry also hits a payment or connection
-                # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
-                    raise
-                first_err = retry_err
+        # Log what we're about to do — makes auxiliary operations visible
+        _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
+        if task:
+            logger.info("Auxiliary %s: using %s (%s)%s",
+                         task, resolved_provider or "auto", final_model or "default",
+                         f" at {_base_info}" if _base_info and "openrouter" not in _base_info else "")
 
-        # ── Nous auth refresh parity with main agent ──────────────────
-        client_is_nous = (
-            resolved_provider == "nous"
-            or base_url_host_matches(_base_info, "inference-api.nousresearch.com")
-        )
-        if _is_auth_error(first_err) and client_is_nous:
-            refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
-                cache_provider=resolved_provider or "nous",
-                model=final_model,
-                async_mode=False,
-                base_url=resolved_base_url,
-                api_key=resolved_api_key,
-                api_mode=resolved_api_mode,
-                main_runtime=main_runtime,
-                is_vision=(task == "vision"),
-            )
-            if refreshed_client is not None:
-                logger.info("Auxiliary %s: refreshed Nous runtime credentials after 401, retrying",
-                            task or "call")
-                if refreshed_model and refreshed_model != kwargs.get("model"):
-                    kwargs["model"] = refreshed_model
-                return _validate_llm_response(
-                    refreshed_client.chat.completions.create(**kwargs), task)
+        # Pass the client's actual base_url (not just resolved_base_url) so
+        # endpoint-specific temperature overrides can distinguish
+        # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
+        kwargs = _build_call_kwargs(
+            resolved_provider, final_model, messages,
+            temperature=temperature, max_tokens=max_tokens,
+            tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+            base_url=_base_info or resolved_base_url)
 
-        # ── Auth refresh retry ───────────────────────────────────────
-        if (_is_auth_error(first_err)
-                and resolved_provider not in {"auto", "", None}
-                and not client_is_nous):
-            if _refresh_provider_credentials(resolved_provider):
+        # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
+        _client_base = str(getattr(client, "base_url", "") or "")
+        if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+            kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+        # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
+        # then payment fallback.
+        try:
+            return _validate_llm_response(
+                client.chat.completions.create(**kwargs), task)
+        except Exception as first_err:
+            if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
+                retry_kwargs = dict(kwargs)
+                retry_kwargs.pop("temperature", None)
                 logger.info(
-                    "Auxiliary %s: refreshed %s credentials after auth error, retrying",
-                    task or "call", resolved_provider,
+                    "Auxiliary %s: provider rejected temperature; retrying once without it",
+                    task or "call",
                 )
-                return _retry_same_provider_sync(
-                    task=task,
-                    resolved_provider=resolved_provider,
-                    resolved_model=resolved_model,
-                    resolved_base_url=resolved_base_url,
-                    resolved_api_key=resolved_api_key,
-                    resolved_api_mode=resolved_api_mode,
-                    main_runtime=main_runtime,
-                    final_model=final_model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                )
+                try:
+                    return _validate_llm_response(
+                        client.chat.completions.create(**retry_kwargs), task)
+                except Exception as retry_err:
+                    retry_err_str = str(retry_err)
+                    # If retry still fails, fall through to the max_tokens /
+                    # payment / auth chains below using the temperature-stripped
+                    # kwargs.  Re-raise only if the retry hit something those
+                    # chains won't handle.
+                    if not (
+                        _is_payment_error(retry_err)
+                        or _is_connection_error(retry_err)
+                        or _is_auth_error(retry_err)
+                        or "max_tokens" in retry_err_str
+                        or "unsupported_parameter" in retry_err_str
+                    ):
+                        raise
+                    first_err = retry_err
+                    kwargs = retry_kwargs
 
-        # ── Same-provider credential-pool recovery ─────────────────────
-        pool_provider = _recoverable_pool_provider(resolved_provider, client)
-        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
-            recovery_err = first_err
-            if _is_rate_limit_error(first_err):
+            err_str = str(first_err)
+            # ZAI vision models (glm-4v-flash etc.) return error code 1210
+            # ("API 调用参数有误") when max_tokens is passed on multimodal
+            # calls.  The error message does NOT contain "max_tokens" so the
+            # generic retry below never fires.  Detect the ZAI-specific error
+            # and strip max_tokens before retrying.
+            _is_zai_param_error = (
+                "1210" in err_str
+                and "bigmodel" in str(getattr(client, "base_url", ""))
+            )
+            if max_tokens is not None and (
+                "max_tokens" in err_str
+                or "unsupported_parameter" in err_str
+                or _is_unsupported_parameter_error(first_err, "max_tokens")
+                or _is_zai_param_error
+            ):
+                kwargs.pop("max_tokens", None)
+                kwargs.pop("max_completion_tokens", None)
                 try:
                     return _validate_llm_response(
                         client.chat.completions.create(**kwargs), task)
                 except Exception as retry_err:
-                    if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
+                    # If the max_tokens retry also hits a payment or connection
+                    # error, fall through to the fallback chain below.
+                    if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
-                    recovery_err = retry_err
-            if _recover_provider_pool(pool_provider, recovery_err):
-                logger.info(
-                    "Auxiliary %s: recovered %s via credential-pool rotation after %s",
-                    task or "call", pool_provider, type(recovery_err).__name__,
-                )
-                return _retry_same_provider_sync(
-                    task=task,
-                    resolved_provider=resolved_provider,
-                    resolved_model=resolved_model,
-                    resolved_base_url=resolved_base_url,
-                    resolved_api_key=resolved_api_key,
-                    resolved_api_mode=resolved_api_mode,
-                    main_runtime=main_runtime,
-                    final_model=final_model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                )
+                    first_err = retry_err
 
-        # ── Payment / credit exhaustion fallback ──────────────────────
-        # When the resolved provider returns 402 or a credit-related error,
-        # try alternative providers instead of giving up.  This handles the
-        # common case where a user runs out of OpenRouter credits but has
-        # Codex OAuth or another provider available.
-        #
-        # ── Connection error fallback ────────────────────────────────
-        # When a provider endpoint is unreachable (DNS failure, connection
-        # refused, timeout), try alternative providers.  This handles stale
-        # Codex/OAuth tokens that authenticate but whose endpoint is down,
-        # and providers the user never configured that got picked up by
-        # the auto-detection chain.
-        #
-        # ── Rate-limit fallback (#13579) ─────────────────────────────
-        # When the provider returns a 429 rate-limit (not billing), fall
-        # back to an alternative provider instead of exhausting retries
-        # against the same rate-limited endpoint.
-        should_fallback = (
-            _is_payment_error(first_err)
-            or _is_connection_error(first_err)
-            or _is_rate_limit_error(first_err)
-        )
-        # Respect explicit provider choice for transient errors (auth, request
-        # validation, etc.) but allow fallback when the provider clearly cannot
-        # serve the request due to capacity: payment/quota exhaustion and
-        # connection failures are capacity problems, not request constraints.
-        # See #26803: daily token quota (429 + "too many tokens per day") must
-        # fall back just like a 402 credit error.
-        is_auto = resolved_provider in {"auto", "", None}
-        # Capacity errors bypass the explicit-provider gate: the provider
-        # literally cannot serve this request regardless of user intent.
-        is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
-        if should_fallback and (is_auto or is_capacity_error):
-            if _is_payment_error(first_err):
-                reason = "payment error"
-                # Resolve the actual provider label (resolved_provider may be
-                # "auto"; the client's base_url tells us which backend got the
-                # 402). Mark THAT label unhealthy so subsequent aux calls
-                # skip it instead of paying another doomed RTT.
-                _mark_provider_unhealthy(
-                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider
-                )
-            elif _is_rate_limit_error(first_err):
-                reason = "rate limit"
-            else:
-                reason = "connection error"
-            logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
-
-            # Fallback order (#26882, #26803):
-            #   1. User-configured fallback_chain (per-task) if set
-            #   2. Main agent model (last-resort safety net)
-            # For auto users (no explicit aux provider), use the full
-            # auto-detection chain instead — its Step 1 IS the main agent
-            # model, so users on `auto` already get main-model fallback.
-            fb_client, fb_model, fb_label = (None, None, "")
-            if is_auto:
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason=reason)
-            else:
-                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason)
-
-            if fb_client is not None:
-                fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
-                    base_url=str(getattr(fb_client, "base_url", "") or ""))
-                return _validate_llm_response(
-                    fb_client.chat.completions.create(**fb_kwargs), task)
-            # All fallback layers exhausted — emit a single user-visible
-            # warning so the operator knows aux task is about to fail.
-            # (#26882) The error itself is re-raised below.
-            logger.warning(
-                "Auxiliary %s: %s on %s and all fallbacks exhausted "
-                "(fallback_chain + main agent model). Raising original error.",
-                task or "call", reason, resolved_provider,
+            # ── Nous auth refresh parity with main agent ──────────────────
+            client_is_nous = (
+                resolved_provider == "nous"
+                or base_url_host_matches(_base_info, "inference-api.nousresearch.com")
             )
-        # Connection/timeout errors leave the cached client poisoned (closed
-        # httpx transport, half-read stream, dead async loop).  Drop it from
-        # the cache regardless of whether we found a fallback above so the
-        # next auxiliary call rebuilds a fresh client instead of reusing the
-        # dead one.  See issue #23432.
-        if _is_connection_error(first_err):
-            try:
-                _evict_cached_client_instance(client)
-            except Exception:
-                logger.debug("Auxiliary: cache eviction after connection error failed",
-                             exc_info=True)
-        raise
+            if _is_auth_error(first_err) and client_is_nous:
+                refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
+                    cache_provider=resolved_provider or "nous",
+                    model=final_model,
+                    async_mode=False,
+                    base_url=resolved_base_url,
+                    api_key=resolved_api_key,
+                    api_mode=resolved_api_mode,
+                    main_runtime=main_runtime,
+                    is_vision=(task == "vision"),
+                    use_cache=use_cache,
+                )
+                if refreshed_client is not None:
+                    if not use_cache:
+                        uncached_clients_to_close.append(refreshed_client)
+                    logger.info("Auxiliary %s: refreshed Nous runtime credentials after 401, retrying",
+                                task or "call")
+                    if refreshed_model and refreshed_model != kwargs.get("model"):
+                        kwargs["model"] = refreshed_model
+                    return _validate_llm_response(
+                        refreshed_client.chat.completions.create(**kwargs), task)
+
+            # ── Auth refresh retry ───────────────────────────────────────
+            if (_is_auth_error(first_err)
+                    and resolved_provider not in {"auto", "", None}
+                    and not client_is_nous):
+                if _refresh_provider_credentials(resolved_provider):
+                    logger.info(
+                        "Auxiliary %s: refreshed %s credentials after auth error, retrying",
+                        task or "call", resolved_provider,
+                    )
+                    return _retry_same_provider_sync(
+                        task=task,
+                        resolved_provider=resolved_provider,
+                        resolved_model=resolved_model,
+                        resolved_base_url=resolved_base_url,
+                        resolved_api_key=resolved_api_key,
+                        resolved_api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
+                        final_model=final_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                        use_cache=use_cache,
+                    )
+
+            # ── Same-provider credential-pool recovery ─────────────────────
+            pool_provider = _recoverable_pool_provider(resolved_provider, client)
+            if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+                recovery_err = first_err
+                if _is_rate_limit_error(first_err):
+                    try:
+                        return _validate_llm_response(
+                            client.chat.completions.create(**kwargs), task)
+                    except Exception as retry_err:
+                        if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
+                            raise
+                        recovery_err = retry_err
+                if _recover_provider_pool(pool_provider, recovery_err):
+                    logger.info(
+                        "Auxiliary %s: recovered %s via credential-pool rotation after %s",
+                        task or "call", pool_provider, type(recovery_err).__name__,
+                    )
+                    return _retry_same_provider_sync(
+                        task=task,
+                        resolved_provider=resolved_provider,
+                        resolved_model=resolved_model,
+                        resolved_base_url=resolved_base_url,
+                        resolved_api_key=resolved_api_key,
+                        resolved_api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
+                        final_model=final_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                        use_cache=use_cache,
+                    )
+
+            # ── Payment / credit exhaustion fallback ──────────────────────
+            # When the resolved provider returns 402 or a credit-related error,
+            # try alternative providers instead of giving up.  This handles the
+            # common case where a user runs out of OpenRouter credits but has
+            # Codex OAuth or another provider available.
+            #
+            # ── Connection error fallback ────────────────────────────────
+            # When a provider endpoint is unreachable (DNS failure, connection
+            # refused, timeout), try alternative providers.  This handles stale
+            # Codex/OAuth tokens that authenticate but whose endpoint is down,
+            # and providers the user never configured that got picked up by
+            # the auto-detection chain.
+            #
+            # ── Rate-limit fallback (#13579) ─────────────────────────────
+            # When the provider returns a 429 rate-limit (not billing), fall
+            # back to an alternative provider instead of exhausting retries
+            # against the same rate-limited endpoint.
+            should_fallback = (
+                _is_payment_error(first_err)
+                or _is_connection_error(first_err)
+                or _is_rate_limit_error(first_err)
+            )
+            # Respect explicit provider choice for transient errors (auth, request
+            # validation, etc.) but allow fallback when the provider clearly cannot
+            # serve the request due to capacity: payment/quota exhaustion and
+            # connection failures are capacity problems, not request constraints.
+            # See #26803: daily token quota (429 + "too many tokens per day") must
+            # fall back just like a 402 credit error.
+            is_auto = resolved_provider in {"auto", "", None}
+            # Capacity errors bypass the explicit-provider gate: the provider
+            # literally cannot serve this request regardless of user intent.
+            is_capacity_error = _is_payment_error(first_err) or _is_connection_error(first_err)
+            if should_fallback and (is_auto or is_capacity_error):
+                if _is_payment_error(first_err):
+                    reason = "payment error"
+                    # Resolve the actual provider label (resolved_provider may be
+                    # "auto"; the client's base_url tells us which backend got the
+                    # 402). Mark THAT label unhealthy so subsequent aux calls
+                    # skip it instead of paying another doomed RTT.
+                    _mark_provider_unhealthy(
+                        _recoverable_pool_provider(resolved_provider, client) or resolved_provider
+                    )
+                elif _is_rate_limit_error(first_err):
+                    reason = "rate limit"
+                else:
+                    reason = "connection error"
+                logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
+                            task or "call", reason, resolved_provider, first_err)
+
+                # Fallback order (#26882, #26803):
+                #   1. User-configured fallback_chain (per-task) if set
+                #   2. Main agent model (last-resort safety net)
+                # For auto users (no explicit aux provider), use the full
+                # auto-detection chain instead — its Step 1 IS the main agent
+                # model, so users on `auto` already get main-model fallback.
+                fb_client, fb_model, fb_label = (None, None, "")
+                if is_auto:
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason=reason)
+                else:
+                    fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                        task, resolved_provider or "auto", reason=reason)
+                    if fb_client is None:
+                        fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                            resolved_provider, task, reason=reason)
+
+                if fb_client is not None:
+                    if not use_cache:
+                        uncached_clients_to_close.append(fb_client)
+                    fb_kwargs = _build_call_kwargs(
+                        fb_label, fb_model, messages,
+                        temperature=temperature, max_tokens=max_tokens,
+                        tools=tools, timeout=effective_timeout,
+                        extra_body=effective_extra_body,
+                        base_url=str(getattr(fb_client, "base_url", "") or ""))
+                    return _validate_llm_response(
+                        fb_client.chat.completions.create(**fb_kwargs), task)
+                # All fallback layers exhausted — emit a single user-visible
+                # warning so the operator knows aux task is about to fail.
+                # (#26882) The error itself is re-raised below.
+                logger.warning(
+                    "Auxiliary %s: %s on %s and all fallbacks exhausted "
+                    "(fallback_chain + main agent model). Raising original error.",
+                    task or "call", reason, resolved_provider,
+                )
+            # Connection/timeout errors leave the cached client poisoned (closed
+            # httpx transport, half-read stream, dead async loop).  Drop it from
+            # the cache regardless of whether we found a fallback above so the
+            # next auxiliary call rebuilds a fresh client instead of reusing the
+            # dead one.  See issue #23432.
+            if _is_connection_error(first_err):
+                try:
+                    _evict_cached_client_instance(client)
+                except Exception:
+                    logger.debug("Auxiliary: cache eviction after connection error failed",
+                                 exc_info=True)
+            raise
+    finally:
+        for _client_to_close in uncached_clients_to_close:
+            _close_aux_client_quietly(_client_to_close)
 
 
 def extract_content_or_reasoning(response) -> str:

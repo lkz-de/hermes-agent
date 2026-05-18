@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import time
+
+import httpx
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -883,6 +885,177 @@ class TestAuxiliaryPoolAwareness:
         assert client is fake_client
         assert model == "openai/gpt-5.4-mini"
         assert mock_resolve.call_count == 1
+
+    def test_get_cached_client_evicts_closed_sync_client(self):
+        import agent.auxiliary_client as aux
+
+        stale_client = SimpleNamespace(
+            base_url="https://example.test/v1",
+            _real_client=SimpleNamespace(is_closed=False),
+        )
+        fresh_client = SimpleNamespace(
+            base_url="https://example.test/v1",
+            _real_client=SimpleNamespace(is_closed=False),
+        )
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[(stale_client, "model-a"), (fresh_client, "model-a")],
+        ) as mock_resolve:
+            aux.shutdown_cached_clients()
+            try:
+                client, model = aux._get_cached_client("openrouter", "model-a")
+                assert client is stale_client
+                assert model == "model-a"
+
+                stale_client._real_client.is_closed = True
+                client, model = aux._get_cached_client("openrouter", "model-a")
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert client is fresh_client
+        assert model == "model-a"
+        assert mock_resolve.call_count == 2
+
+    def test_title_generation_bypasses_auxiliary_client_cache_and_closes_clients(self):
+        import agent.auxiliary_client as aux
+
+        first_client = MagicMock()
+        first_client.base_url = "https://api.openai.test/v1"
+        first_client.chat.completions.create.return_value = {"ok": 1}
+        second_client = MagicMock()
+        second_client.base_url = "https://api.openai.test/v1"
+        second_client.chat.completions.create.return_value = {"ok": 2}
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openrouter", "model-a", None, None, None)),
+            patch("agent.auxiliary_client.resolve_provider_client", side_effect=[(first_client, "model-a"), (second_client, "model-a")]) as mock_resolve,
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+        ):
+            aux.shutdown_cached_clients()
+            try:
+                assert call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}]) == {"ok": 1}
+                assert call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}]) == {"ok": 2}
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert mock_resolve.call_count == 2
+        first_client.close.assert_called_once_with()
+        second_client.close.assert_called_once_with()
+
+    def test_close_aux_client_quietly_closes_sync_httpx_transport(self):
+        from agent import auxiliary_client as aux
+
+        class _CountingTransport(httpx.BaseTransport):
+            def __init__(self):
+                self.close_count = 0
+
+            def handle_request(self, request):
+                raise AssertionError("unexpected request")
+
+            def close(self):
+                self.close_count += 1
+
+        transport = _CountingTransport()
+        inner = httpx.Client(transport=transport)
+
+        class _WrappedSyncClient:
+            def __init__(self, wrapped):
+                self._client = wrapped
+
+            def close(self):
+                self._client.close()
+
+        aux._close_aux_client_quietly(_WrappedSyncClient(inner))
+
+        assert inner.is_closed is True
+        assert transport.close_count == 1
+
+    def test_title_generation_closes_uncached_fallback_client(self):
+        from agent import auxiliary_client as aux
+
+        payment_error = Exception("Payment Required")
+        payment_error.status_code = 402
+        primary_client = MagicMock()
+        primary_client.base_url = "https://api.openrouter.ai/v1"
+        primary_client.chat.completions.create.side_effect = payment_error
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://inference-api.nousresearch.com/v1"
+        fallback_client.chat.completions.create.return_value = {"ok": "fallback"}
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("auto", "model-a", None, None, None)),
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(primary_client, "model-a")),
+            patch("agent.auxiliary_client._try_payment_fallback", return_value=(fallback_client, "model-b", "nous")) as mock_fallback,
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+        ):
+            aux.shutdown_cached_clients()
+            try:
+                result = call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}])
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert result == {"ok": "fallback"}
+        mock_fallback.assert_called_once()
+        primary_client.close.assert_called_once_with()
+        fallback_client.close.assert_called_once_with()
+
+    def test_title_generation_closes_uncached_auth_refresh_retry_client(self):
+        from agent import auxiliary_client as aux
+
+        auth_error = Exception("Unauthorized")
+        auth_error.status_code = 401
+        primary_client = MagicMock()
+        primary_client.base_url = "https://api.openrouter.ai/v1"
+        primary_client.chat.completions.create.side_effect = auth_error
+        retry_client = MagicMock()
+        retry_client.base_url = "https://api.openrouter.ai/v1"
+        retry_client.chat.completions.create.return_value = {"ok": "retry"}
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openrouter", "model-a", None, None, None)),
+            patch("agent.auxiliary_client.resolve_provider_client", side_effect=[(primary_client, "model-a"), (retry_client, "model-a")]),
+            patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True),
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+        ):
+            aux.shutdown_cached_clients()
+            try:
+                result = call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}])
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert result == {"ok": "retry"}
+        primary_client.close.assert_called_once_with()
+        retry_client.close.assert_called_once_with()
+
+    def test_title_generation_closes_uncached_nous_refresh_client(self):
+        from agent import auxiliary_client as aux
+
+        auth_error = Exception("Unauthorized")
+        auth_error.status_code = 401
+        primary_client = MagicMock()
+        primary_client.base_url = "https://inference-api.nousresearch.com/v1"
+        primary_client.chat.completions.create.side_effect = auth_error
+        refreshed_client = MagicMock()
+        refreshed_client.base_url = "https://inference-api.nousresearch.com/v1"
+        refreshed_client.chat.completions.create.return_value = {"ok": "refreshed"}
+
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("nous", "model-a", None, None, None)),
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(primary_client, "model-a")),
+            patch("agent.auxiliary_client._refresh_nous_auxiliary_client", return_value=(refreshed_client, "model-a")) as mock_refresh,
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+        ):
+            aux.shutdown_cached_clients()
+            try:
+                result = call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}])
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert result == {"ok": "refreshed"}
+        assert mock_refresh.call_args.kwargs["use_cache"] is False
+        primary_client.close.assert_called_once_with()
+        refreshed_client.close.assert_called_once_with()
 
 
 # ── Payment / credit exhaustion fallback ─────────────────────────────────
