@@ -9,6 +9,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.signal import SignalAdapter
+from gateway.platforms.signal_format import markdown_to_signal
 
 
 # ---------------------------------------------------------------------------
@@ -18,6 +19,11 @@ from gateway.platforms.signal import SignalAdapter
 def _m2s(text: str):
     """Shorthand: call the static method and return (plain_text, styles)."""
     return SignalAdapter._markdown_to_signal(text)
+
+
+def test_shared_helper_matches_signal_adapter_wrapper():
+    text = "🙂 **bold** and `code`"
+    assert markdown_to_signal(text) == SignalAdapter._markdown_to_signal(text)
 
 
 def _style_types(styles: list[str]) -> list[str]:
