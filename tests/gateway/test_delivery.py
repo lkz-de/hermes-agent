@@ -15,6 +15,20 @@ class TestParseTargetPlatformChat:
         assert target.chat_id == "12345"
         assert target.is_explicit is True
 
+    def test_signal_group_chat_id_with_base64_slash_preserved(self):
+        target = DeliveryTarget.parse("signal:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=")
+        assert target.platform == Platform.SIGNAL
+        assert target.chat_id == "group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A="
+        assert target.thread_id is None
+        assert target.is_explicit is True
+
+    def test_signal_group_chat_id_with_thread_segment_preserved_separately(self):
+        target = DeliveryTarget.parse("signal:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=:thread-42")
+        assert target.platform == Platform.SIGNAL
+        assert target.chat_id == "group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A="
+        assert target.thread_id == "thread-42"
+        assert target.is_explicit is True
+
     def test_platform_only_no_chat_id(self):
         target = DeliveryTarget.parse("discord")
         assert target.platform == Platform.DISCORD
@@ -66,6 +80,26 @@ class TestTargetToStringRoundtrip:
         reparsed = DeliveryTarget.parse(s)
         assert reparsed.platform == Platform.TELEGRAM
         assert reparsed.chat_id == "999"
+
+    def test_signal_group_roundtrip_preserves_full_group_id(self):
+        original = "signal:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A="
+        target = DeliveryTarget.parse(original)
+        assert target.to_string() == original
+
+        reparsed = DeliveryTarget.parse(target.to_string())
+        assert reparsed.platform == Platform.SIGNAL
+        assert reparsed.chat_id == "group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A="
+        assert reparsed.thread_id is None
+
+    def test_signal_group_roundtrip_preserves_thread_segment(self):
+        original = "signal:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=:thread-42"
+        target = DeliveryTarget.parse(original)
+        assert target.to_string() == original
+
+        reparsed = DeliveryTarget.parse(target.to_string())
+        assert reparsed.platform == Platform.SIGNAL
+        assert reparsed.chat_id == "group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A="
+        assert reparsed.thread_id == "thread-42"
 
 
 class TestCaseSensitiveChatIdParsing:

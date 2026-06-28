@@ -536,6 +536,29 @@ def test_parse_session_key_with_user_id_part():
     assert result == {"platform": "telegram", "chat_type": "group", "chat_id": "chat1"}
 
 
+def test_parse_session_key_signal_group_preserves_prefixed_group_id():
+    result = _parse_session_key(
+        "agent:main:signal:group:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A="
+    )
+    assert result == {
+        "platform": "signal",
+        "chat_type": "group",
+        "chat_id": "group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=",
+    }
+
+
+def test_parse_session_key_signal_group_with_thread_suffix_omits_thread_id():
+    """Signal group keys may have a trailing suffix; recovery keeps chat_id only."""
+    result = _parse_session_key(
+        "agent:main:signal:group:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=:thread-42"
+    )
+    assert result == {
+        "platform": "signal",
+        "chat_type": "group",
+        "chat_id": "group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=",
+    }
+
+
 def test_parse_session_key_dm_with_thread():
     """DM keys use parts[5] as thread_id unambiguously."""
     result = _parse_session_key("agent:main:telegram:dm:chat1:topic42")

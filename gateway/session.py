@@ -12,6 +12,7 @@ import hashlib
 import logging
 import os
 import json
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -100,16 +101,39 @@ from utils import atomic_replace
 # filenames in agent_runtime_helpers). Any value that could escape the
 # sessions directory as a path must be rejected at the entry boundary.
 # Rejects: parent traversal (``..``), a path separator anywhere (``/`` or
-# ``\``, so a non-leading Windows separator can't slip through), and a
-# leading Windows drive letter (``C:``). Legitimate session keys are
-# colon-delimited multi-segment ids (``agent:main:<platform>:...``) and
-# never contain these, so there are no false positives in practice.
+# ``\\``), and a leading Windows drive letter (``C:``). One exception exists:
+# persisted Signal group session keys encode chat ids as
+# ``agent:<namespace>:signal:group:group:<base64>`` and standard base64 may
+# contain ``/``. Allow ``/`` only when the ENTIRE value matches that canonical
+# shape — never on substring presence alone.
+_SIGNAL_GROUP_SESSION_KEY_RE = re.compile(
+    r"^agent:[^:/\\]+:signal:group:group:[A-Za-z0-9+/=]+(?::[^:/\\]+)*$"
+)
+
+
+def _is_signal_group_session_key(value: str) -> bool:
+    """Return True only for the canonical persisted Signal group key shape."""
+    return bool(_SIGNAL_GROUP_SESSION_KEY_RE.fullmatch(value))
+
+
 def _is_path_unsafe(value: object) -> bool:
-    """Return True if ``value`` could traverse outside the sessions dir."""
+    """Return True if ``value`` could traverse outside the sessions dir.
+
+    Safety relies on validating the FULL persisted ``session_key`` shape here.
+    Bare Signal chat IDs like ``group:<base64>`` may also contain ``/``, but
+    they never cross the filesystem boundary directly; they must first be
+    embedded into the canonical ``agent:...:signal:group:group:<base64>`` key.
+    The unconditional ``..`` / ``\\`` checks below run before the Signal
+    allowlist, which is the load-bearing ordering that keeps the carve-out safe.
+    """
     if not value:
         return False
     s = str(value)
-    if ".." in s or "/" in s or "\\" in s:
+    if s.startswith(("/", "\\")):
+        return True
+    if ".." in s or "\\" in s:
+        return True
+    if "/" in s and not _is_signal_group_session_key(s):
         return True
     # Leading Windows drive path, e.g. "C:\..." or "d:/...". A bare "x:"
     # with no following separator isn't a usable absolute path, and the
@@ -741,7 +765,12 @@ class SessionEntry:
         session_key = data["session_key"]
         session_id = data["session_id"]
 
-        # Validate path-sensitive fields to prevent directory traversal (CWE-22)
+        # Validate path-sensitive fields to prevent directory traversal (CWE-22).
+        # This guard is intentionally scoped to the FULL persisted session key / id
+        # values that later feed path construction. ``origin.chat_id`` may contain
+        # a bare Signal ``group:<base64>`` payload with ``/``, but that value is
+        # only considered safe after it has been embedded into the canonical
+        # ``agent:...:signal:group:group:<base64>`` session-key shape above.
         for _field, _val in (("session_key", session_key), ("session_id", session_id)):
             if _is_path_unsafe(_val):
                 raise ValueError(

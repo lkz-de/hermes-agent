@@ -1,11 +1,13 @@
 """Tests for gateway session management."""
 import json
 import pytest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import (
+    SessionEntry,
     SessionSource,
     SessionStore,
     build_session_context,
@@ -97,6 +99,114 @@ class TestSessionSourceRoundtrip:
         """
         with pytest.raises(ValueError):
             SessionSource.from_dict({"platform": "nonexistent", "chat_id": "1"})
+
+
+class TestSessionEntryValidation:
+    def test_signal_group_session_key_allows_base64_slash(self):
+        entry = SessionEntry.from_dict({
+            "session_key": "agent:main:signal:group:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=",
+            "session_id": "sess_signal_group",
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+            "origin": {
+                "platform": "signal",
+                "chat_id": "group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=",
+                "chat_type": "group",
+            },
+        })
+        assert entry.session_key == "agent:main:signal:group:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A="
+
+    def test_signal_group_session_key_allows_trailing_thread_segment(self):
+        entry = SessionEntry.from_dict({
+            "session_key": "agent:main:signal:group:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=:thread-42",
+            "session_id": "sess_signal_group_thread",
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+            "origin": {
+                "platform": "signal",
+                "chat_id": "group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=",
+                "thread_id": "thread-42",
+                "chat_type": "group",
+            },
+        })
+        assert entry.session_key == "agent:main:signal:group:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=:thread-42"
+
+    def test_signal_group_session_key_rejects_namespace_with_slash(self):
+        with pytest.raises(ValueError, match="Invalid session_key"):
+            SessionEntry.from_dict({
+                "session_key": "agent:foo/bar:signal:group:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=",
+                "session_id": "sess_signal_group",
+                "created_at": "2026-01-01T00:00:00",
+                "updated_at": "2026-01-01T00:00:00",
+                "origin": {
+                    "platform": "signal",
+                    "chat_id": "group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=",
+                    "chat_type": "group",
+                },
+            })
+
+    def test_signal_group_session_key_rejects_traversal_disguised_by_signal_prefix(self):
+        with pytest.raises(ValueError, match="Invalid session_key"):
+            SessionEntry.from_dict({
+                "session_key": "agent:main:signal:group:group:abc/../../evil",
+                "session_id": "sess_signal_group",
+                "created_at": "2026-01-01T00:00:00",
+                "updated_at": "2026-01-01T00:00:00",
+                "origin": {
+                    "platform": "signal",
+                    "chat_id": "group:abc/../../evil",
+                    "chat_type": "group",
+                },
+            })
+
+    def test_signal_group_session_key_rejects_absolute_path_disguised_by_signal_prefix(self):
+        with pytest.raises(ValueError, match="Invalid session_key"):
+            SessionEntry.from_dict({
+                "session_key": "/tmp/agent:main:signal:group:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=",
+                "session_id": "sess_signal_group",
+                "created_at": "2026-01-01T00:00:00",
+                "updated_at": "2026-01-01T00:00:00",
+                "origin": {
+                    "platform": "signal",
+                    "chat_id": "group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=",
+                    "chat_type": "group",
+                },
+            })
+
+
+class TestSessionStorePersistence:
+    def test_signal_group_session_key_roundtrips_through_sessions_json(self, tmp_path):
+        config = GatewayConfig()
+        store = SessionStore(tmp_path / "sessions", config)
+        session_key = "agent:main:signal:group:group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A="
+        session_id = "sess_signal_group"
+
+        entry = SessionEntry(
+            session_key=session_key,
+            session_id=session_id,
+            created_at=datetime(2026, 1, 1, 0, 0, 0),
+            updated_at=datetime(2026, 1, 1, 0, 0, 0),
+            origin=SessionSource(
+                platform=Platform.SIGNAL,
+                chat_id="group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A=",
+                chat_type="group",
+            ),
+            platform=Platform.SIGNAL,
+            chat_type="group",
+        )
+
+        store._entries[session_key] = entry
+        store._save()
+
+        reloaded = SessionStore(tmp_path / "sessions", config)
+        reloaded._ensure_loaded()
+
+        assert session_key in reloaded._entries
+        restored = reloaded._entries[session_key]
+        assert restored.session_key == session_key
+        assert restored.session_id == session_id
+        assert restored.origin is not None
+        assert restored.origin.chat_id == "group:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/A="
 
 
 class TestSessionSourceDescription:
