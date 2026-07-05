@@ -159,3 +159,67 @@ class TestPluginDispatch:
         assert payload["provider"] == "codex"
         assert payload["model"] == "gpt-image-2-high"
         assert payload["aspect_ratio"] == "portrait"
+
+    def test_fal_provider_forwards_explicit_model_and_preserves_returned_model(self, monkeypatch):
+        from plugins.image_gen.fal import FalImageGenProvider
+        from tools import image_generation_tool
+
+        captured = {}
+
+        def fake_image_generate_tool(**kwargs):
+            captured.update(kwargs)
+            return json.dumps(
+                {
+                    "success": True,
+                    "image": "/tmp/fal-test.png",
+                    "model": kwargs["model"],
+                    "modality": "text",
+                }
+            )
+
+        monkeypatch.setattr(image_generation_tool, "image_generate_tool", fake_image_generate_tool)
+
+        out = FalImageGenProvider().generate(
+            "draw cat",
+            "square",
+            model="fal-ai/gpt-image-2",
+        )
+
+        assert captured["model"] == "fal-ai/gpt-image-2"
+        assert out["success"] is True
+        assert out["model"] == "fal-ai/gpt-image-2"
+        assert out["provider"] == "fal"
+
+    def test_dispatch_keeps_unknown_fal_config_model_on_soft_fallback_path(self, monkeypatch, tmp_path):
+        from plugins.image_gen.fal import FalImageGenProvider
+        from tools import image_generation_tool
+        from agent import image_gen_registry as registry_module
+        from hermes_cli import plugins as plugins_module
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "image_gen:\n  provider: fal\n  model: fal-ai/nonexistent-9000\n"
+        )
+
+        class _Handler:
+            def get(self_inner):
+                return {"images": [{"url": "https://out/img.png", "width": 1, "height": 1}]}
+
+        capture = {}
+
+        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda *a, **k: None)
+        monkeypatch.setattr(
+            registry_module,
+            "get_provider",
+            lambda name: FalImageGenProvider() if name == "fal" else None,
+        )
+        monkeypatch.setattr(image_generation_tool, "_submit_fal_request", lambda endpoint, arguments: capture.update({"endpoint": endpoint, "arguments": arguments}) or _Handler())
+        monkeypatch.setattr(image_generation_tool, "_resolve_managed_fal_gateway", lambda: object())
+
+        dispatched = image_generation_tool._dispatch_to_plugin_provider("draw cat", "square")
+        assert dispatched is not None
+        payload = json.loads(dispatched)
+
+        assert payload["success"] is True
+        assert payload["model"] == image_generation_tool.DEFAULT_MODEL
+        assert capture["endpoint"] == image_generation_tool.DEFAULT_MODEL

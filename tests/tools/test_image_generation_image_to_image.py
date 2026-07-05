@@ -138,9 +138,44 @@ class TestFalRouting:
         raw = image_tool.image_generate_tool(prompt="a cat", aspect_ratio="square")
         out = json.loads(raw)
         assert out["success"] is True
+        assert out["model"] == "fal-ai/nano-banana-pro"
         assert out["modality"] == "text"
         assert capture["endpoint"] == "fal-ai/nano-banana-pro"
         assert "image_urls" not in capture["arguments"]
+
+    def test_text_to_image_honors_explicit_model_override(self, cfg_home, monkeypatch):
+        import tools.image_generation_tool as image_tool
+
+        _write_cfg(cfg_home, {"image_gen": {"model": "fal-ai/nano-banana-pro"}})
+        capture: dict = {}
+        self._patch_submit(monkeypatch, image_tool, capture)
+
+        raw = image_tool.image_generate_tool(
+            prompt="a cat",
+            aspect_ratio="square",
+            model="fal-ai/gpt-image-2",
+        )
+        out = json.loads(raw)
+        assert out["success"] is True
+        assert out["model"] == "fal-ai/gpt-image-2"
+        assert capture["endpoint"] == "fal-ai/gpt-image-2"
+
+    def test_text_to_image_rejects_unknown_explicit_model_override(self, cfg_home, monkeypatch):
+        import tools.image_generation_tool as image_tool
+
+        _write_cfg(cfg_home, {"image_gen": {"model": "fal-ai/nano-banana-pro"}})
+        capture: dict = {}
+        self._patch_submit(monkeypatch, image_tool, capture)
+
+        raw = image_tool.image_generate_tool(
+            prompt="a cat",
+            aspect_ratio="square",
+            model="fal-ai/nonexistent-9000",
+        )
+        out = json.loads(raw)
+        assert out["success"] is False
+        assert "Unknown explicit FAL model override" in out["error"]
+        assert capture == {}
 
     def test_image_to_image_routes_to_edit_endpoint(self, cfg_home, monkeypatch):
         import tools.image_generation_tool as image_tool

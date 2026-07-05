@@ -138,6 +138,7 @@ class FalImageGenProvider(ImageGenProvider):
         passthrough = {
             key: kwargs[key]
             for key in (
+                "model",
                 "num_inference_steps",
                 "guidance_scale",
                 "num_images",
@@ -190,11 +191,11 @@ class FalImageGenProvider(ImageGenProvider):
         response.setdefault("provider", "fal")
         response.setdefault("prompt", prompt)
         response.setdefault("aspect_ratio", aspect)
-        # Annotate model best-effort — the legacy pipeline resolves it
-        # internally, so query it after the fact for the response shape.
+        # Annotate model best-effort — the legacy pipeline should now return it,
+        # but keep a fallback for older/partial responses.
         if "model" not in response:
             try:
-                model_id, _meta = _it._resolve_fal_model()
+                model_id, _meta = _it._resolve_fal_model(kwargs.get("model"))
                 response["model"] = model_id
             except Exception:  # noqa: BLE001
                 pass

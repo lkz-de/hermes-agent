@@ -324,6 +324,10 @@ class TestModelResolution:
             mid, _ = image_tool._resolve_fal_model()
         assert mid == "fal-ai/flux-2/klein/9b"
 
+    def test_unknown_explicit_model_override_errors_clearly(self, image_tool):
+        with pytest.raises(ValueError, match="Unknown explicit FAL model override"):
+            image_tool._resolve_fal_model("fal-ai/nonexistent-9000")
+
     def test_env_var_fallback_when_no_config(self, image_tool, monkeypatch):
         monkeypatch.setenv("FAL_IMAGE_MODEL", "fal-ai/z-image/turbo")
         with patch("hermes_cli.config.load_config", return_value={}):
@@ -376,6 +380,10 @@ class TestRegistryIntegration:
     def test_aspect_ratio_enum_is_three_values(self, image_tool):
         enum = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["aspect_ratio"]["enum"]
         assert set(enum) == {"landscape", "square", "portrait"}
+
+    def test_schema_description_says_image_result_may_be_path_or_url(self, image_tool):
+        desc = image_tool.IMAGE_GENERATE_SCHEMA["description"]
+        assert "file path or URL" in desc
 
 
 # ---------------------------------------------------------------------------

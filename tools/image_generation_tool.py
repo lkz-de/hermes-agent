@@ -532,13 +532,19 @@ def _resolve_fal_model(explicit: Optional[str] = None) -> tuple:
 
     Precedence: explicit caller override → config.yaml → env → default.
 
-    Returns (model_id, metadata_dict). Falls back to DEFAULT_MODEL if the
-    configured model is unknown (logged as a warning).
+    Returns (model_id, metadata_dict). Unknown explicit caller overrides are a
+    hard error; unknown configured models still fall back to DEFAULT_MODEL with
+    a warning for backward compatibility.
     """
     if isinstance(explicit, str):
         explicit = explicit.strip()
         if explicit in FAL_MODELS:
             return explicit, FAL_MODELS[explicit]
+        if explicit:
+            raise ValueError(
+                f"Unknown explicit FAL model override '{explicit}'. Choose a supported "
+                "FAL model id or omit `model` to use the configured default."
+            )
 
     model_id = ""
     try:
@@ -867,9 +873,9 @@ def image_generate_tool(
     legacy callers don't break when switching models).
 
     Returns a JSON string with ``{"success": bool, "image": url | None,
-    "modality": "text" | "image", "error": str, "error_type": str}``.
+    "model": str | None, "modality": "text" | "image", "error": str,
+    "error_type": str}``.
     """
-    model_id, meta = _resolve_fal_model(model)
 
     # Collect any source images (primary + references) into one ordered list.
     source_images: list = []
@@ -880,12 +886,8 @@ def image_generate_tool(
             if isinstance(ref, str) and ref.strip():
                 source_images.append(ref.strip())
 
-    edit_endpoint = meta.get("edit_endpoint")
-    use_edit = bool(source_images) and bool(edit_endpoint)
-    modality = "image" if use_edit else "text"
-
     debug_call_data = {
-        "model": model_id,
+        "model": model.strip() if isinstance(model, str) and model.strip() else None,
         "parameters": {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
@@ -894,7 +896,7 @@ def image_generate_tool(
             "num_images": num_images,
             "output_format": output_format,
             "seed": seed,
-            "modality": modality,
+            "modality": None,
             "source_images": len(source_images),
         },
         "error": None,
@@ -906,6 +908,30 @@ def image_generate_tool(
     start_time = datetime.datetime.now()
 
     try:
+        model_id, meta = _resolve_fal_model(model)
+        edit_endpoint = meta.get("edit_endpoint")
+        use_edit = bool(source_images) and bool(edit_endpoint)
+        modality = "image" if use_edit else "text"
+
+        debug_call_data = {
+            "model": model_id,
+            "parameters": {
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "num_images": num_images,
+                "output_format": output_format,
+                "seed": seed,
+                "modality": modality,
+                "source_images": len(source_images),
+            },
+            "error": None,
+            "success": False,
+            "images_generated": 0,
+            "generation_time": 0,
+        }
+
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
             raise ValueError("Prompt is required and must be a non-empty string")
 
@@ -1014,6 +1040,7 @@ def image_generate_tool(
         response_data = {
             "success": True,
             "image": formatted_images[0]["url"] if formatted_images else None,
+            "model": model_id,
             "modality": modality,
         }
 
@@ -1189,7 +1216,7 @@ IMAGE_GENERATE_SCHEMA = {
         "and model default to the user-configured route, but you may pass "
         "optional `provider` / `model` overrides when one specific call must "
         "hit a different image route. Returns the result in the `image` field "
-        "file path. To show it to the user, reference that path/URL in your "
+        "as a file path or URL. To show it to the user, reference that path/URL in your "
         "response using the file-delivery convention for the current platform "
         "(your platform guidance describes how files are delivered here). When "
         "the active terminal backend has a different filesystem, successful "
@@ -1325,9 +1352,12 @@ def _dispatch_to_plugin_provider(
     if not configured:
         return None
 
-    # Also read configured model so we can pass it to the plugin. A per-call
-    # model override wins over config.
-    configured_model = model_override or _read_configured_image_model()
+    # Read the configured model so non-FAL providers receive their default, but
+    # do not promote a FAL config value into an explicit override. The FAL
+    # plugin re-enters ``image_generate_tool()``, which already reads config and
+    # preserves the legacy soft-fallback for stale/unknown configured models.
+    configured_model = _read_configured_image_model()
+    explicit_model = model_override.strip() if isinstance(model_override, str) and model_override.strip() else None
 
     try:
         # Import locally so plugin discovery isn't triggered just by
@@ -1365,8 +1395,11 @@ def _dispatch_to_plugin_provider(
 
     kwargs: Dict[str, Any] = {"prompt": prompt, "aspect_ratio": aspect_ratio}
     try:
-        if configured_model:
-            kwargs["model"] = configured_model
+        model_for_provider = explicit_model
+        if model_for_provider is None and configured != "fal":
+            model_for_provider = configured_model
+        if model_for_provider:
+            kwargs["model"] = model_for_provider
         if isinstance(image_url, str) and image_url.strip():
             kwargs["image_url"] = image_url.strip()
         norm_refs = None
