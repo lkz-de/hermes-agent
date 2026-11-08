@@ -193,13 +193,14 @@ def _cron_mirror_message(job: dict, text: str) -> str:
 
 def _maybe_mirror_cron_delivery(
     job: dict, platform_name: str, chat_id: str, mirror_text: str, thread_id: Optional[str] = None,
-    user_id: Optional[str] = None, *, enabled: bool = False,
+    user_id: Optional[str] = None, *, enabled: bool = False, cold_seed: Optional[Any] = None,
 ) -> None:
     """Best-effort mirror of a cron delivery into the origin chat's session. No-op unless
     ``enabled`` (caller resolves it, scoped to the origin target). Rides the same
     ``mirror_to_session`` path as ``send_message``, passing ``user_id`` so user-isolated group
-    chats resolve to the scheduling member. All failures swallowed — a successful delivery must
-    never be reported failed because the mirror broke."""
+    chats resolve to the scheduling member. With no open session (idle chat), ``cold_seed(text)``
+    seeds the one the next reply opens (``scheduler_delivery_cold_seed``). All failures swallowed — a
+    successful delivery must never be reported failed because the mirror broke."""
     if not enabled:
         return
     text = (mirror_text or "").strip()
@@ -207,8 +208,6 @@ def _maybe_mirror_cron_delivery(
         return
     try:
         from gateway.mirror import mirror_to_session
-        # USER role + labelled prefix, NOT assistant: an assistant-role mirror lands
-        # assistant→assistant and breaks strict alternation; consecutive user turns merge safely.
         # The brief is not the agent speaking; an assistant-role mirror lands as assistant→assistant after
         # the agent's last turn and breaks strict alternation (issue #2221, the exact failure #2313
         # removed). A user-role turn collapses safely via repair_message_sequence's consecutive-user merge
@@ -217,6 +216,7 @@ def _maybe_mirror_cron_delivery(
         ok = mirror_to_session(
             platform_name, str(chat_id), _cron_mirror_message(job, text),
             source_label="cron", thread_id=thread_id, user_id=user_id, role="user")
+        ok = ok or bool(cold_seed and cold_seed(text))
         if ok:
             logger.info(
                 "Job '%s': mirrored delivery into %s:%s session transcript",
@@ -1488,7 +1488,7 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
             origin.get("platform"), origin.get("chat_id"), origin.get("thread_id"))
     _maybe_mirror_cron_delivery(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
-        user_id=t.origin_user_id,
+        user_id=t.origin_user_id, cold_seed=_cold_seed.cold_session_seeder(t),
         enabled=t.mirror_this_target and not thread_seeded and not inchannel_seeded)
 
 
@@ -1997,3 +1997,4 @@ from cron.scheduler_delivery_room import (
 from cron import scheduler_delivery_origin as _origin
 from cron import scheduler_preflight as _preflight
 from cron import scheduler_script as _script
+from cron import scheduler_delivery_cold_seed as _cold_seed
