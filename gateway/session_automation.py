@@ -155,14 +155,14 @@ _FOLD_HEADER_RE = re.compile(r'\[IMPORTANT: \d+ background process results arriv
 
 
 def _fold_completion(event, waiting, identity):
-    from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER, _mark_internal_notification
+    from gateway.run_notifications import _mark_internal_notification, strip_internal_notification_footer
     from tools.process_registry_notifications import process_completion_display_text
     descriptor = _descriptor(waiting['payload'])
     identities = sorted({*(descriptor.get('identities') or [waiting['request_id']]),
                          *(event.metadata.get('automation_identities') or [identity])})
 
     def body(text):
-        text = text.rstrip().removesuffix(INTERNAL_NOTIFICATION_FOOTER).rstrip()
+        text = strip_internal_notification_footer(text)
         folded = _FOLD_HEADER_RE.match(text)
         return text[folded.end():] if folded else text
     event.text = _mark_internal_notification('\n\n'.join((
